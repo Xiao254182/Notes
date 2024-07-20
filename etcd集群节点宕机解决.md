@@ -1,0 +1,125 @@
+### etcd集群节点宕机解决
+
+集群环境
+
+| IP             | 主机名      | 节点名             |
+| -------------- | ----------- | ------------------ |
+| 192.168.100.12 | proxy-slave | etcd-server-100-12 |
+| 192.168.100.13 | master      | etcd-server-100-13 |
+| 192.168.100.14 | worker      | etcd-server-100-14 |
+
+搭建kubernetes集群时
+
+<待添加>
+
+通过日志发现是kubectl无法连接到api-server服务器，然后去api-server服务器去查看日志，发现是worker主机无法与etcd节点连接，
+
+于是去woker主机查看etcd日志（下述日志文件路径和配置文件地址均是我自定义的）
+
+```shell
+[root@worker etcd]# tail -f /data/logs/etcd-server/etcd.stdout.log
+```
+
+![](C:\Users\Hu\Desktop\3\1.png)
+
+此时集群中其他节点也报无法与该节点连接
+
+![](C:\Users\Hu\Desktop\3\2.png)
+
+于是在worker主机前台运行etcd服务
+
+```shell
+[root@worker etcd]# cat etcd-server-startup.sh
+#!/bin/sh
+./etcd --name etcd-server-100-14 \
+       --data-dir /data/etcd/etcd-server \
+       --listen-peer-urls https://192.168.100.14:2380 \
+       --listen-client-urls https://192.168.100.14:2379,http://127.0.0.1:2379 \
+       --quota-backend-bytes 8000000000 \
+       --initial-advertise-peer-urls https://192.168.100.14:2380 \
+       --advertise-client-urls https://192.168.100.14:2379,http://127.0.0.1:2379 \
+       --initial-cluster  etcd-server-100-12=https://192.168.100.12:2380,etcd-server-100-13=https://192.168.100.13:2380,etcd-server-100-14=https://192.168.100.14:2380 \
+       --ca-file ./certs/ca.pem \
+       --cert-file ./certs/etcd-peer.pem \
+       --key-file ./certs/etcd-peer-key.pem \
+       --client-cert-auth  \
+       --trusted-ca-file ./certs/ca.pem \
+       --peer-ca-file ./certs/ca.pem \
+       --peer-cert-file ./certs/etcd-peer.pem \
+       --peer-key-file ./certs/etcd-peer-key.pem \
+       --peer-client-cert-auth \
+       --peer-trusted-ca-file ./certs/ca.pem \
+       --log-output stdout
+[root@worker etcd]# bash etcd-server-startup.sh
+```
+
+![](C:\Users\Hu\Desktop\3\3.png)
+
+根据日志显示，etcd 中发生了一个严重的错误。日志表明当前的 raft 日志范围出现了问题，可能是因为 raft 日志损坏、被截断或丢失，这是因为etcd 进程 crash，同时，其 data 文件丢失，此时重启就会出错，这种极端情况，需要人工介入恢复，也是合理的
+
+我们首先停止supervisor服务，因为supervisor服务是一个守护进程工具,会在进程意外退出或异常时一直自动重启进程，确保进程始终处于运行状态，我们在维护集群是要做到修复成功后手动调试，因此需要关闭。
+
+```shell
+[root@worker ~]# systemctl stop supervisord
+```
+
+然后找到集群中的其他节点，在该集群中删除宕机的节点
+
+```shell
+[root@master etcd]# ls
+certs          etcd     etcd-server-100-13.etcd  README-etcdctl.md  READMEv2-etcdctl.md
+Documentation  etcdctl  etcd-server-startup.sh   README.md
+[root@master etcd]# ./etcdctl member list
+ae638890e671854: name=etcd-server-100-13 peerURLs=https://192.168.100.13:2380 clientURLs=http://127.0.0.1:2379,https://192.168.100.13:2379 isLeader=false
+667ed0cec3659276: name=etcd-server-100-14 peerURLs=https://192.168.100.14:2380 clientURLs=http://127.0.0.1:2379,https://192.168.100.14:2379 isLeader=false
+c70ab18d2d82b1e7: name=etcd-server-100-12 peerURLs=https://192.168.100.12:2380 clientURLs=http://127.0.0.1:2379,https://192.168.100.12:2379 isLeader=true
+```
+
+![](C:\Users\Hu\Desktop\3\4.png)
+
+```shell
+[root@master etcd]# ./etcdctl member remove 667ed0cec3659276
+Removed member 667ed0cec3659276 from cluster
+[root@master etcd]# ./etcdctl member list
+ae638890e671854: name=etcd-server-100-13 peerURLs=https://192.168.100.13:2380 clientURLs=http://127.0.0.1:2379,https://192.168.100.13:2379 isLeader=false
+c70ab18d2d82b1e7: name=etcd-server-100-12 peerURLs=https://192.168.100.12:2380 clientURLs=http://127.0.0.1:2379,https://192.168.100.12:2379 isLeader=true
+[root@master etcd]# ./etcdctl member add etcd-server-100-14 http://192.168.100.14:2380
+Added member named etcd-server-100-14 with ID 2c4714bed868b116 to cluster
+
+ETCD_NAME="etcd-server-100-14"
+ETCD_INITIAL_CLUSTER="etcd-server-100-13=https://192.168.100.13:2380,etcd-server-100-14=http://192.168.100.14:2380,etcd-server-100-12=https://192.168.100.12:2380"
+ETCD_INITIAL_CLUSTER_STATE="existing"
+```
+
+返回worker主机，修改etcd的启动脚本
+
+```shell
+[root@worker ~]# cd /opt/etcd/
+[root@worker etcd]# vim etcd-server-startup.sh
+```
+
+![](C:\Users\Hu\Desktop\3\5.png)
+
+然后删除worker主机节点的原data(如果有)
+
+```shell
+[root@worker etcd]# rf -rf etcd-server-100-14.etcd
+```
+
+此时再次重启etcd服务，服务正常启动
+
+```shell
+[root@worker ~]# systemctl start supervisord && supervisorctl update
+[root@worker ~]# supervisorctl status
+etcd-server-100-14               RUNNING   pid 33956, uptime 18:41:59
+kube-apiserver-100-14            RUNNING   pid 33957, uptime 18:41:59
+kube-controller-manager-100-14   RUNNING   pid 33954, uptime 18:41:59
+kube-scheduler-100-14            RUNNING   pid 33955, uptime 18:41:59
+[root@worker etcd]# ./etcdctl cluster-health
+member ae638890e671854 is healthy: got healthy result from http://127.0.0.1:2379
+member 667ed0cec3659276 is healthy: got healthy result from http://127.0.0.1:2379
+member c70ab18d2d82b1e7 is healthy: got healthy result from http://127.0.0.1:2379
+cluster is healthy
+```
+
+![](C:\Users\Hu\Desktop\3\6.png)
